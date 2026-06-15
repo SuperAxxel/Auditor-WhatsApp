@@ -7,6 +7,8 @@
 // @match        https://web.whatsapp.com/*
 // @run-at       document-start
 // @grant        none
+// @updateURL    https://github.com/SuperAxxel/Auditor-WhatsApp/raw/refs/heads/main/script_navegador.user.js
+// @downloadURL  https://github.com/SuperAxxel/Auditor-WhatsApp/raw/refs/heads/main/script_navegador.user.js
 // ==/UserScript==
 
 (function() {
