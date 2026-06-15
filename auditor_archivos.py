@@ -371,20 +371,20 @@ class App(tk.Tk):
             self.update() # Refresca la interfaz
 
             # 1. Descargamos el nuevo código de GitHub
-            nuevo_codigo = requests.get(URL_CODIGO_GITHUB, timeout=10).text
+            nuevo_codigo_bytes = requests.get(URL_CODIGO_GITHUB, timeout=10).content
 
-            # 2. Lo guardamos en un archivo temporal
-            archivo_temp = "auditor_temp.py"
-            with open(archivo_temp, "w", encoding="utf-8") as f:
-                f.write(nuevo_codigo)
+            # --- CORRECCIÓN: RUTAS ABSOLUTAS ---
+            # 2. Obligamos a que se guarde en la MISMA carpeta exacta donde está el programa original
+            archivo_temp = os.path.join(RUTA_BASE, "auditor_temp.py")
+                        with open(archivo_temp, "wb") as f:
+                            f.write(nuevo_codigo_bytes)
 
-            # 3. Preparamos las rutas para el .bat
+            # 3. Preparamos las rutas para el .bat (también con ruta absoluta)
             archivo_actual = os.path.abspath(__file__)
-            archivo_bat = "actualizador.bat"
+            archivo_bat = os.path.join(RUTA_BASE, "actualizador.bat")
             ruta_python = sys.executable
 
             # 4. Creamos el script .bat que hará el trabajo sucio
-            # (Espera 2 seg, sobreescribe el archivo viejo, abre el nuevo, y se borra a sí mismo)
             codigo_bat = f"""@echo off
 timeout /t 2 /nobreak > NUL
 move /Y "{archivo_temp}" "{archivo_actual}"
