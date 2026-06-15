@@ -9,9 +9,13 @@ import re
 from datetime import datetime
 import locale
 
+VERSION_LOCAL = 24.3
+URL_VERSION_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/version.txt"
+URL_CODIGO_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/auditor_archivos.py"
+
 # --- 1. AUTO-INSTALADOR DE DEPENDENCIAS ---
 def instalar_dependencias():
-    paquetes = ['opencv-python', 'pytesseract', 'watchdog', 'plyer']
+    paquetes = ['opencv-python', 'pytesseract', 'watchdog', 'plyer', 'requests']
     for paquete in paquetes:
         try:
             __import__(paquete if paquete != 'opencv-python' else 'cv2')
@@ -30,6 +34,8 @@ from plyer import notification
 import tkinter as tk
 from tkinter import ttk
 import winreg
+import requests
+from tkinter import messagebox
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
@@ -304,9 +310,13 @@ class VigilanteDescargas(FileSystemEventHandler):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Auditor Automático")
-        self.geometry("350x250")
+        self.title(f"Auditor Automático v{VERSION_LOCAL}")
+        self.geometry("350x280")
         self.config = self.cargar_config()
+
+        # --- NUEVO: Etiqueta de actualización oculta por defecto ---
+        self.label_alerta = tk.Label(self, text="", fg="red", font=("Arial", 10, "bold"))
+        self.label_alerta.pack(pady=(5, 0))
 
         tk.Label(self, text="Clave de Captura:").pack(pady=(10, 0))
         self.combo_clave = ttk.Combobox(self, values=self.config.get("claves", ["CLAVE-01"]))
@@ -323,6 +333,8 @@ class App(tk.Tk):
 
         tk.Button(self, text="Guardar y Minimizar", command=self.guardar_y_minimizar).pack(pady=10)
 
+        threading.Thread(target=self.revisar_actualizacion, daemon=True).start()
+
         self.procesador = ProcesadorDocumentos()
         self.vigilante = VigilanteDescargas(self.procesador, self)
         self.observer = Observer()
@@ -330,6 +342,65 @@ class App(tk.Tk):
         self.observer.start()
 
         self.protocol("WM_DELETE_WINDOW", self.cerrar_app)
+
+    def revisar_actualizacion(self):
+        try:
+            respuesta = requests.get(URL_VERSION_GITHUB, timeout=5)
+            version_nube = float(respuesta.text.strip())
+            
+            if version_nube > VERSION_LOCAL:
+                # Usamos self.after para que la ventana emergente no congele el hilo secundario
+                self.after(0, self.preguntar_actualizacion, version_nube)
+        except Exception as e:
+            print("No se pudo verificar la actualización:", e)
+
+    def preguntar_actualizacion(self, version_nube):
+        # Muestra la ventana emergente de Aceptar / Rechazar
+        respuesta = messagebox.askyesno(
+            "¡Actualización Disponible!",
+            f"Se ha detectado la versión {version_nube} en el servidor.\n\n"
+            f"¿Deseas descargarla e instalarla ahora? El programa se reiniciará."
+        )
+        if respuesta: # Si el usuario le dio a "Sí"
+            self.ejecutar_actualizacion()
+
+    def ejecutar_actualizacion(self):
+        try:
+            self.label_alerta = tk.Label(self, text="Descargando actualización...", fg="blue", font=("Arial", 10, "bold"))
+            self.label_alerta.pack(pady=5)
+            self.update() # Refresca la interfaz
+
+            # 1. Descargamos el nuevo código de GitHub
+            nuevo_codigo = requests.get(URL_CODIGO_GITHUB, timeout=10).text
+
+            # 2. Lo guardamos en un archivo temporal
+            archivo_temp = "auditor_temp.py"
+            with open(archivo_temp, "w", encoding="utf-8") as f:
+                f.write(nuevo_codigo)
+
+            # 3. Preparamos las rutas para el .bat
+            archivo_actual = os.path.abspath(__file__)
+            archivo_bat = "actualizador.bat"
+            ruta_python = sys.executable
+
+            # 4. Creamos el script .bat que hará el trabajo sucio
+            # (Espera 2 seg, sobreescribe el archivo viejo, abre el nuevo, y se borra a sí mismo)
+            codigo_bat = f"""@echo off
+timeout /t 2 /nobreak > NUL
+move /Y "{archivo_temp}" "{archivo_actual}"
+start "" "{ruta_python}" "{archivo_actual}"
+del "%~f0"
+"""
+            with open(archivo_bat, "w", encoding="utf-8") as f:
+                f.write(codigo_bat)
+
+            # 5. Ejecutamos el .bat en segundo plano y cerramos el programa actual
+            subprocess.Popen([archivo_bat], shell=True)
+            self.cerrar_app()
+            sys.exit()
+
+        except Exception as e:
+            messagebox.showerror("Error de Actualización", f"No se pudo actualizar:\n{e} \nPor favor avisa a soporte técnico.")
 
     def cargar_config(self):
         if os.path.exists(ARCHIVO_CONFIG):
