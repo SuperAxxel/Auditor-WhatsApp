@@ -376,8 +376,8 @@ class App(tk.Tk):
             # --- CORRECCIÓN: RUTAS ABSOLUTAS ---
             # 2. Obligamos a que se guarde en la MISMA carpeta exacta donde está el programa original
             archivo_temp = os.path.join(RUTA_BASE, "auditor_temp.py")
-                        with open(archivo_temp, "wb") as f:
-                            f.write(nuevo_codigo_bytes)
+            with open(archivo_temp, "wb") as f:
+                f.write(nuevo_codigo_bytes)
 
             # 3. Preparamos las rutas para el .bat (también con ruta absoluta)
             archivo_actual = os.path.abspath(__file__)
