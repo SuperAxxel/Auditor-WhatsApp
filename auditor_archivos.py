@@ -1,450 +1,1188 @@
-import os
-import sys
+# -*- coding: utf-8 -*-
+"""
+Auditor Automático de WhatsApp  -  v25.0
+Vigila Descargas, lee con OCR los documentos bajados desde WhatsApp Web (SIAC / INE)
+y los acomoda en carpetas  FOLIO-NOMBRE APELLIDO-CAPTURISTA.
+"""
+import base64
+import importlib
+import importlib.util
 import json
-import time
-import shutil
-import threading
-import subprocess
+import logging
+import os
+import platform
+import queue
 import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import locale
+from logging.handlers import RotatingFileHandler
+from urllib.parse import urljoin, urlparse
 
-VERSION_LOCAL = 24.3
+VERSION_LOCAL = "25.0"
 URL_VERSION_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/version.txt"
 URL_CODIGO_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/auditor_archivos.py"
+URL_CODIGO_ESTABLE = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/estable/auditor_archivos.py"
 
-# --- 1. AUTO-INSTALADOR DE DEPENDENCIAS ---
+RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
+ARCHIVO_CONFIG = os.path.join(RUTA_BASE, "config.json")
+ARCHIVO_LOG = os.path.join(RUTA_BASE, "auditor.log")
+ARCHIVO_TELEGRAM = os.path.join(RUTA_BASE, "telegram.json")
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+URL_RELAY = "https://script.google.com/macros/s/AKfycbw_9cs_Nv_rW19kGK79HBwhV3ukWHT8URFNERvJEBDcCwfeZudsb9QzDmv_BGLKWsuZ/exec"
+RUTA_DESCARGAS = os.path.join(os.path.expanduser("~"), "Downloads")
+
+# Si un RECUADRO no logra leer el nombre: False = se guarda igual como "RECUADRO-SIN NOMBRE hhmmss-..."
+#                                         True  = se manda a revisión manual (comportamiento anterior)
+RECUADRO_SIN_NOMBRE_A_REVISION = False
+
+# ---------------------------------------------------------------- LOG
+def configurar_log():
+    logger = logging.getLogger("auditor")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = RotatingFileHandler(ARCHIVO_LOG, maxBytes=500_000, backupCount=2, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    if sys.stderr is not None:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    return logger
+
+log = configurar_log()
+sys.excepthook = lambda t, v, tb: log.error("Excepción no controlada", exc_info=(t, v, tb))
+
+# ---------------------------------------------------------------- 1. AUTO-INSTALADOR
+DEPENDENCIAS = {  # módulo importable -> paquete de pip
+    "cv2": "opencv-python",
+    "numpy": "numpy",
+    "pytesseract": "pytesseract",
+    "watchdog": "watchdog",
+    "plyer": "plyer",
+    "requests": "requests",
+}
+
 def instalar_dependencias():
-    paquetes = ['opencv-python', 'pytesseract', 'watchdog', 'plyer', 'requests']
-    for paquete in paquetes:
-        try:
-            __import__(paquete if paquete != 'opencv-python' else 'cv2')
-        except ImportError:
-            print(f"Instalando {paquete}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", paquete])
+    faltan = [pip for mod, pip in DEPENDENCIAS.items() if importlib.util.find_spec(mod) is None]
+    if not faltan:
+        return
+    log.info("Instalando dependencias: %s", ", ".join(faltan))
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *faltan])
+    importlib.invalidate_caches()
 
 instalar_dependencias()
 
 import cv2
 import numpy as np
 import pytesseract
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from plyer import notification
-import tkinter as tk
-from tkinter import ttk
-import winreg
 import requests
-from tkinter import messagebox
+import tkinter as tk
+import winreg
+from plyer import notification
+from tkinter import filedialog, messagebox, ttk
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
+# ---------------------------------------------------------------- 2. TESSERACT
+def localizar_tesseract():
+    candidatos = [
+        shutil.which("tesseract"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+    ]
+    for c in candidatos:
+        if c and os.path.isfile(c):
+            return c
+    return None
 
-RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
-ARCHIVO_CONFIG = os.path.join(RUTA_BASE, 'config.json')
-RUTA_DESCARGAS = os.path.join(os.path.expanduser('~'), 'Downloads')
+RUTA_TESSERACT = localizar_tesseract()
+if RUTA_TESSERACT:
+    pytesseract.pytesseract.tesseract_cmd = RUTA_TESSERACT
+    _tessdata = os.path.join(os.path.dirname(RUTA_TESSERACT), "tessdata")
+    if os.path.isdir(_tessdata):
+        os.environ["TESSDATA_PREFIX"] = _tessdata
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # 1 hilo por OCR: rinde más al leer varias imágenes en paralelo
 
-try:
-    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
-except:
-    pass 
+def tesseract_listo():
+    if not RUTA_TESSERACT:
+        return ("No se encontró Tesseract OCR.\nInstálalo (UB-Mannheim) con el idioma Spanish "
+                "y vuelve a abrir el programa.")
+    if not os.path.isfile(os.path.join(os.environ.get("TESSDATA_PREFIX", ""), "spa.traineddata")):
+        return "A Tesseract le falta el idioma español (spa.traineddata)."
+    return None
 
-class ProcesadorDocumentos:
-    
-    # --- FUNCIÓN LINGÜÍSTICA PARA NOMBRES COMPUESTOS ---
-    def agrupar_nombres_compuestos(self, texto):
-        # Limpiamos basura del OCR
-        palabras = texto.replace(',', '').replace('.', '').replace('-', '').split()
-        prefijos = {"DE", "DEL", "LA", "LAS", "LOS", "MAC", "MC", "SAN", "Y", "VAN", "VON"}
-        
-        resultado = []
-        compuesto = ""
-        
-        for p in palabras:
-            if p in prefijos:
-                compuesto += p + "_" # Le ponemos pegamento
-            else:
-                resultado.append(compuesto + p)
-                compuesto = "" # Reiniciamos el pegamento
-                
-        if compuesto: # Por si el OCR cortó la lectura a la mitad
-            resultado.append(compuesto[:-1])
-            
-        return resultado
+# ---------------------------------------------------------------- 3. CONSTANTES Y UTILIDADES
+EXT_IMG = (".jpg", ".jpeg", ".png", ".webp")
+EXT_TEMPORALES = (".tmp", ".crdownload", ".part", ".download")
+ESPERADOS = {"RECUADRO": 3, "DESCARGAR": 4, "WINBACK": 5}          # imágenes + 1 audio
+MODO_POR_CANTIDAD = {v: k for k, v in ESPERADOS.items()}           # para nombres antiguos (v24)
+ESPERA_LOTE_LEGADO = 4.0
+ESPERA_LOTE_INCOMPLETO = 12.0
 
-    def procesar_archivos(self, lista_archivos, clave, capturista):
+PREFIJOS = {"DE", "DEL", "LA", "LAS", "LOS", "MAC", "MC", "SAN", "Y", "VAN", "VON"}
+ETIQUETAS = {"NOMBRE", "NOMBRES", "CLIENTE"}
+PALABRAS_FIN_INE = {"DOMICILIO", "CALLE", "C", "AV", "AVENIDA", "EDAD", "SEXO", "CLAVE", "AÑO", "COL", "COLONIA"}
+PALABRAS_INE = ("ELECTORAL", "INSTITUTO", "NACIONAL", "CREDENCIAL", "VOTAR")
+
+RE_FOLIO = re.compile(r"FOLIO\s*(?:SIAC|STAC|S1AC)?\s*[:\-]?\s*(\d+)")
+RE_PREFIJO_NOMBRE = re.compile(r"^(?:NOMBRES?|CLIENTE|TITULAR)\b\s*")
+RE_LOTE_NUEVO = re.compile(r"^WP_(RECUADRO|DESCARGAR|WINBACK)_(\d+)_", re.I)
+RE_LOTE_IMG_LEGADO = re.compile(r"^WP_IMG_(\d+)_", re.I)
+RE_LOTE_AUDIO_LEGADO = re.compile(r"^WP_AUDIO_(\d+)", re.I)
+
+DIAS = ["LUNES", "MARTES", "MIÉRCOLES", "JUEVES", "VIERNES", "SÁBADO", "DOMINGO"]
+MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO",
+         "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
+
+MOTIVOS = {
+    "sin_folio": "No se encontró el folio SIAC",
+    "sin_nombre": "No se pudo leer el nombre",
+    "lote_incompleto": "Llegaron archivos incompletos",
+    "error": "Error inesperado al procesar",
+}
+
+# Agrega la versión nueva ARRIBA de la lista en cada release (la ventana se abre sola al actualizar)
+NOVEDADES = [
+    ("25.0", "Octubre 2026", [
+        "Los RECUADROS ya se etiquetan correctamente. Si no se alcanza a leer el nombre, se guardan como "
+        "«RECUADRO-SIN NOMBRE» en lugar de irse a revisión manual.",
+        "Lectura de la INE más precisa: varios intentos de lectura y corrección con nombres como David, Javier u Octavio.",
+        "Procesamiento más rápido: las imágenes de cada cliente se leen al mismo tiempo.",
+        "Si un lote llega incompleto, se manda a revisión manual en su propia subcarpeta, con el motivo en el nombre.",
+        "Descarga desde WhatsApp Web más confiable: solo toma imágenes del chat abierto. Recuerda darle Play "
+        "al audio de cada cliente antes de descargar.",
+        "Nuevo botón «Reportar error»: envía tu mensaje, una imagen opcional y el registro del programa directo a soporte.",
+        "Nuevo botón «Novedades» para volver a ver esta ventana cuando quieras.",
+        "Actualizaciones más seguras: se valida el archivo antes de instalarlo y se conserva un respaldo.",
+        "El programa ya no se abre dos veces por accidente y avisa si falta Tesseract OCR.",
+    ]),
+]
+
+def fecha_carpeta(d=None):
+    """Igual que '%A %d %B %Y' en español, pero sin depender del locale de Windows."""
+    d = d or datetime.now()
+    return f"{DIAS[d.weekday()]} {d.day:02d} {MESES[d.month - 1]} {d.year}"
+
+def limpiar_ruta(texto):
+    return re.sub(r'[<>:"/\\|?*]', "", texto).strip()
+
+def version_a_tupla(txt):
+    return tuple(int(x) for x in re.findall(r"\d+", txt))
+
+def avisar(titulo, mensaje, timeout=3):
+    try:
+        notification.notify(title=titulo, message=mensaje, app_name="Auditor Automático", timeout=timeout)
+    except Exception as e:
+        log.warning("No se pudo mostrar la notificación: %s", e)
+
+def mover_seguro(origen, carpeta_destino):
+    os.makedirs(carpeta_destino, exist_ok=True)
+    base = os.path.basename(origen)
+    destino = os.path.join(carpeta_destino, base)
+    n = 1
+    while os.path.exists(destino):
+        raiz, ext = os.path.splitext(base)
+        destino = os.path.join(carpeta_destino, f"{raiz}_{n}{ext}")
+        n += 1
+    for _ in range(5):
         try:
-            nombre_final = "DESC"
-            apellido_final = "DESC"
-            folio_final = "DESC"
-            
-            es_recuadro = (len(lista_archivos) == 3)
-            if es_recuadro:
-                folio_final = "RECUADRO"
-                print("Modo RECUADRO detectado automáticamente.")
+            shutil.move(origen, destino)
+            return destino
+        except PermissionError:
+            time.sleep(0.5)
+    raise PermissionError(f"No se pudo mover {origen}")
 
-            for ruta_archivo in lista_archivos:
-                # Evitar leer el archivo de audio (.ogg) con el OCR
-                if not ruta_archivo.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                    continue
+def clasificar_archivo(nombre):
+    """Devuelve (id_lote, modo|None) o None si no es un archivo del auditor."""
+    m = RE_LOTE_NUEVO.match(nombre)
+    if m:
+        return m.group(2), m.group(1).upper()
+    m = RE_LOTE_IMG_LEGADO.match(nombre) or RE_LOTE_AUDIO_LEGADO.match(nombre)
+    if m:
+        return m.group(1), None
+    return None
 
-                img_array = np.fromfile(ruta_archivo, np.uint8)
-                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                
-                if img is None:
-                    print(f"Alerta: Archivo corrupto ignorado ({os.path.basename(ruta_archivo)})")
-                    continue
+# ---------------------------------------------------------------- 4. LECTURA DE NOMBRES
+def preparar_lineas(texto):
+    lineas = (re.sub(r"\s+", " ", re.sub(r"[^A-ZÁÉÍÓÚÜÑ0-9 ]", " ", l)).strip() for l in texto.upper().split("\n"))
+    return [l for l in lineas if len(l) > 2]
 
-                # --- PRE-PROCESADO BASE ---
-                gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                # Ampliamos 1.5x (Vital para contrarrestar la compresión de WhatsApp)
-                gris_ampliado = cv2.resize(gris, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+def agrupar_nombres_compuestos(texto):
+    """'MARIA DE LA CRUZ' -> ['MARIA', 'DE_LA_CRUZ'] """
+    palabras = re.sub(r"[^A-ZÁÉÍÓÚÜÑ0-9 ]", " ", texto.upper()).split()
+    resultado, pegamento = [], ""
+    for p in palabras:
+        if p in PREFIJOS:
+            pegamento += p + "_"
+        else:
+            resultado.append(pegamento + p)
+            pegamento = ""
+    if pegamento:
+        resultado.append(pegamento[:-1])
+    return resultado
 
-                # --- PASADA 1: LECTURA NATURAL (Ideal para el SIAC) ---
-                # Sin whitelist destructiva para que respete acentos y la Ñ
-                texto_base = pytesseract.image_to_string(gris_ampliado, lang='spa')
-                texto_limpio = texto_base.upper()
+def nombre_valido(token):
+    return bool(re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ_]{2,}", token)) and token not in ETIQUETAS
 
-                # --- 1. BÚSQUEDA DEL FOLIO SIAC ---
-                if not es_recuadro and folio_final == "DESC":
-                    # Flexibilidad: Permite que lea "FOLIO SIAC", "FOLIO STAC" o espacios extra
-                    match_folio = re.search(r'FOLIO\s*(?:SIAC|STAC|S1AC)?\s*[:\-]?\s*(\d+)', texto_limpio)
-                    if match_folio:
-                        folio_final = match_folio.group(1)
-                        print(f"¡Folio SIAC encontrado!: {folio_final}")
+def extraer_nombre_siac(lineas):
+    """Busca 'DATOS ... TITULAR' (negocio) y, si no, 'DATOS ... CONTACTO' (persona)."""
+    for clave in ("TITULAR", "CONTACTO"):
+        for i, linea in enumerate(lineas):
+            if "DATOS" not in linea or clave not in linea:
+                continue
+            j = i + 1
+            while j < len(lineas) and lineas[j] in ETIQUETAS:
+                j += 1
+            if j >= len(lineas):
+                continue
+            objetivo = RE_PREFIJO_NOMBRE.sub("", lineas[j]).strip()
+            tokens = agrupar_nombres_compuestos(objetivo)
+            if not tokens or tokens[0] in ETIQUETAS:
+                continue
+            if len(tokens) >= 4:
+                ap = tokens[-2]
+            elif len(tokens) in (2, 3):
+                ap = tokens[1]
+            else:
+                ap = ""
+            return tokens[0].replace("_", " "), ap.replace("_", " ")
+    return None
 
-                # --- 2. BÚSQUEDA DEL NOMBRE EN EL SIAC (DOBLE ESTRATEGIA) ---
-                nombre_encontrado = False
-                
-                # A. ESTRATEGIA PARA NEGOCIOS (Prioridad: Buscar "TITULAR")
-                if "DATOS" in texto_limpio and "TITULAR" in texto_limpio:
-                    lineas = [l.strip() for l in texto_limpio.split('\n') if len(l.strip()) > 2]
-                    for i, linea in enumerate(lineas):
-                        if "DATOS" in linea and "TITULAR" in linea and len(lineas) > i+1:
-                            linea_objetivo = lineas[i+1]
-                            
-                            # Filtro para saltar etiquetas basura
-                            etiquetas = ["NOMBRE", "NOMBRE:", "NOMBRES", "NOMBRES:", "CLIENTE", "CLIENTE:"]
-                            saltos = 1
-                            while linea_objetivo in etiquetas and (i + saltos + 1) < len(lineas):
-                                saltos += 1
-                                linea_objetivo = lineas[i+saltos]
-                                
-                            nc = self.agrupar_nombres_compuestos(linea_objetivo)
-                            
-                            # Seguro anti-fallos: evitamos guardar la palabra "NOMBRE"
-                            if len(nc) >= 1 and nc[0] != "NOMBRE":
-                                nombre_final = nc[0].replace('_', ' ')
-                                if len(nc) >= 4:
-                                    apellido_final = nc[-2].replace('_', ' ')
-                                elif len(nc) in (2, 3):
-                                    apellido_final = nc[1].replace('_', ' ')
-                                else:
-                                    apellido_final = ""
-                                print(f"¡Nombre SIAC (Negocio) procesado!: {nombre_final} {apellido_final}")
-                                nombre_encontrado = True
-                            break
+def _es_etiqueta_nombre(linea):
+    return "NOMBRE" in linea or "N0MBRE" in linea or bool({"NOM", "MBRE"} & set(linea.split()))
 
-                # B. ESTRATEGIA PARA PERSONAS (Fallback: Buscar "CONTACTO")
-                if not nombre_encontrado and "DATOS" in texto_limpio and "CONTACTO" in texto_limpio:
-                    lineas = [l.strip() for l in texto_limpio.split('\n') if len(l.strip()) > 2]
-                    for i, linea in enumerate(lineas):
-                        if "DATOS" in linea and "CONTACTO" in linea and len(lineas) > i+1:
-                            linea_objetivo = lineas[i+1]
-                            
-                            etiquetas = ["NOMBRE", "NOMBRE:", "NOMBRES", "NOMBRES:", "CLIENTE", "CLIENTE:"]
-                            saltos = 1
-                            while linea_objetivo in etiquetas and (i + saltos + 1) < len(lineas):
-                                saltos += 1
-                                linea_objetivo = lineas[i+saltos]
-                                
-                            for etiqueta in ["NOMBRE:", "NOMBRE ", "CLIENTE:", "TITULAR:"]:
-                                if linea_objetivo.startswith(etiqueta):
-                                    linea_objetivo = linea_objetivo.replace(etiqueta, "").strip()
+def extraer_nombre_ine(lineas):
+    """INE: tras 'NOMBRE' vienen apellido paterno, materno y nombre(s)."""
+    for i, linea in enumerate(lineas):
+        if not _es_etiqueta_nombre(linea):
+            continue
+        ape1 = lineas[i + 1] if len(lineas) > i + 1 else ""
+        ape2 = lineas[i + 2] if len(lineas) > i + 2 else ""
+        nom = lineas[i + 3] if len(lineas) > i + 3 else ""
+        # Comparamos por palabra completa (antes 'AV' coincidía dentro de DAVID, JAVIER, OCTAVIO...)
+        es_domicilio = any(t in PALABRAS_FIN_INE for t in nom.split())
+        t_ape = agrupar_nombres_compuestos(ape1)
+        t_nom = agrupar_nombres_compuestos(ape2 if (es_domicilio or not nom) else nom)
+        if t_nom and nombre_valido(t_nom[0]):
+            apellido = t_ape[0].replace("_", " ") if t_ape and nombre_valido(t_ape[0]) else ""
+            return t_nom[0].replace("_", " "), apellido
+    return None
 
-                            # Si la limpieza deja la línea vacía o es la palabra "NOMBRE", lo ignoramos
-                            if not linea_objetivo or linea_objetivo == "NOMBRE":
-                                continue
+# ---------------------------------------------------------------- 5. PROCESADOR (OCR)
+class ProcesadorDocumentos:
+    def __init__(self, publicar_estado):
+        self.publicar_estado = publicar_estado
+        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ocr")
 
-                            nc = self.agrupar_nombres_compuestos(linea_objetivo)
-                            if len(nc) >= 1:
-                                nombre_final = nc[0].replace('_', ' ')
-                                if len(nc) >= 4:
-                                    apellido_final = nc[-2].replace('_', ' ')
-                                elif len(nc) in (2, 3):
-                                    apellido_final = nc[1].replace('_', ' ')
-                                else:
-                                    apellido_final = ""
-                                print(f"¡Nombre SIAC (Persona) procesado!: {nombre_final} {apellido_final}")
-                                break
-
-                # --- PASADA 2: LECTURA AGRESIVA (Solo para la INE) ---
-                # Si vemos que es la INE, aplicamos el filtro para matar hologramas
-                es_ine = "ELECTORAL" in texto_limpio or "INSTITUTO" in texto_limpio or "NACIONAL" in texto_limpio
-                
-                if es_ine and nombre_final == "DESC":
-                    # Aplicamos el Adaptive Threshold solo a la INE
-                    img_procesada = cv2.adaptiveThreshold(
-                        gris_ampliado, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                        cv2.THRESH_BINARY, 31, 11
-                    )
-                    # Volvemos a leer la imagen pero ahora con el filtro aplicado
-                    texto_ine = pytesseract.image_to_string(img_procesada, lang='spa').upper()
-                    
-                    lineas = [l.strip() for l in texto_ine.split('\n') if len(l.strip()) > 2]
-                    for i, linea in enumerate(lineas):
-                        if "NOMBRE" in linea or "N0MBRE" in linea or "NOM" in linea or "MBRE" in linea:
-                            try:
-                                ape1_raw = lineas[i+1] if len(lineas) > i+1 else ""
-                                ape2_raw = lineas[i+2] if len(lineas) > i+2 else ""
-                                nom_raw = lineas[i+3] if len(lineas) > i+3 else ""
-
-                                palabras_fin = ["DOMICILIO", "CALLE", "C.", "AV", "EDAD", "SEXO", "CLAVE", "AÑO"]
-                                es_domicilio = any(kw in nom_raw for kw in palabras_fin)
-
-                                ape1_limpio = self.agrupar_nombres_compuestos(ape1_raw)
-                                apellido_final = ape1_limpio[0].replace('_', ' ') if ape1_limpio else "DESC"
-
-                                if es_domicilio or not nom_raw:
-                                    nom_limpio = self.agrupar_nombres_compuestos(ape2_raw)
-                                else:
-                                    nom_limpio = self.agrupar_nombres_compuestos(nom_raw)
-
-                                nombre_final = nom_limpio[0].replace('_', ' ') if nom_limpio else "DESC"
-                                print(f"¡Nombre INE procesado!: {nombre_final} {apellido_final}")
-                            except Exception as e:
-                                print(f"Error procesando INE: {e}")
-                            break
-
-            # --- VALIDACIÓN FINAL ---
-            if nombre_final == "DESC" or folio_final == "DESC":
-                print(f"Alerta: Faltan datos (Folio: {folio_final}, Nombre: {nombre_final}). Mandando a revisión.")
-                self.mover_a_revision(lista_archivos)
-                return
-
-            # --- CREACIÓN DE CARPETAS ---
-            fecha_str = datetime.now().strftime("%A %d %B %Y").upper()
-            carpeta_cliente = f"{folio_final}-{nombre_final} {apellido_final}-{capturista}".upper().strip("- ")
-            
-            ruta_final = os.path.join(RUTA_BASE, clave, fecha_str, carpeta_cliente)
-            os.makedirs(ruta_final, exist_ok=True)
-
-            for archivo in lista_archivos:
-                shutil.move(archivo, os.path.join(ruta_final, os.path.basename(archivo)))
-            
-            notification.notify(
-                title="Éxito",
-                message=f"Carpeta creada:\n{carpeta_cliente}",
-                app_name="Auditor Automático",
-                timeout=3
-            )
-
+    @staticmethod
+    def ocr(img, config=""):
+        try:
+            return pytesseract.image_to_string(img, lang="spa", config=config, timeout=40).upper()
         except Exception as e:
-            print(f"Error crítico procesando: {e}")
-            self.mover_a_revision(lista_archivos)
+            log.warning("OCR falló: %s", e)
+            return ""
 
-    def mover_a_revision(self, lista_archivos):
-        fecha_str = datetime.now().strftime("%Y-%m-%d")
-        ruta_revision = os.path.join(RUTA_BASE, f"REVISION_MANUAL_{fecha_str}")
-        os.makedirs(ruta_revision, exist_ok=True)
-        
-        for archivo in lista_archivos:
+    def leer_imagen(self, ruta):
+        try:
+            gris = cv2.imdecode(np.fromfile(ruta, np.uint8), cv2.IMREAD_GRAYSCALE)
+        except Exception as e:
+            log.warning("No se pudo abrir %s: %s", os.path.basename(ruta), e)
+            return None
+        if gris is None:
+            log.warning("Archivo corrupto ignorado: %s", os.path.basename(ruta))
+            return None
+        if gris.shape[1] < 1600:  # ampliar compensa la compresión de WhatsApp
+            gris = cv2.resize(gris, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+        return {"ruta": ruta, "gris": gris, "texto": self.ocr(gris)}
+
+    @staticmethod
+    def variantes_ine(gris):
+        """Preprocesados para matar hologramas; se generan solo si hacen falta."""
+        yield "adaptativo", cv2.adaptiveThreshold(
+            gris, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11), "--psm 3"
+        yield "clahe", cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gris), "--psm 6"
+        borroso = cv2.GaussianBlur(gris, (3, 3), 0)
+        yield "otsu", cv2.threshold(borroso, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1], "--psm 6"
+
+    @staticmethod
+    def parece_ine(texto):
+        if any(p in texto for p in PALABRAS_INE):
+            return True
+        return "FOLIO" not in texto and "DATOS" not in texto  # ni SIAC ni texto legible: probamos como INE
+
+    def nombre_desde_ine(self, lec, debug):
+        for etiqueta, img, cfg in self.variantes_ine(lec["gris"]):
+            texto = self.ocr(img, cfg)
+            debug.append(f"===== {os.path.basename(lec['ruta'])} ({etiqueta} {cfg}) =====\n{texto}")
+            res = extraer_nombre_ine(preparar_lineas(texto))
+            if res:
+                log.info("Nombre INE leído con variante '%s'", etiqueta)
+                return res
+        return extraer_nombre_ine(preparar_lineas(lec["texto"]))  # último recurso: lectura natural
+
+    def procesar_lote(self, archivos, modo, clave, capturista):
+        t0 = time.time()
+        es_recuadro = modo == "RECUADRO"
+        imagenes = sorted(f for f in archivos if f.lower().endswith(EXT_IMG))
+        lecturas = [l for l in self.pool.map(self.leer_imagen, imagenes) if l]
+
+        debug, folio, nombre, apellido, origen = [], None, None, None, None
+        diagnostico = None
+        for lec in lecturas:
+            debug.append(f"===== {os.path.basename(lec['ruta'])} (lectura natural) =====\n{lec['texto']}")
+            if not es_recuadro and not folio:
+                m = RE_FOLIO.search(lec["texto"])
+                if m:
+                    folio = m.group(1)
+                    log.info("Folio SIAC encontrado: %s", folio)
+            if origen != "SIAC":
+                res = extraer_nombre_siac(preparar_lineas(lec["texto"]))
+                if res:
+                    nombre, apellido = res
+                    origen = "SIAC"
+                    log.info("Nombre SIAC procesado")
+
+        if not nombre:
+            for lec in lecturas:
+                if not self.parece_ine(lec["texto"]):
+                    continue
+                res = self.nombre_desde_ine(lec, debug)
+                if res:
+                    nombre, apellido = res
+                    origen = "INE"
+                    break
+
+        if es_recuadro:
+            folio = "RECUADRO"
+        elif not folio:
+            return self.a_revision(archivos, modo, "sin_folio", debug)
+
+        if not nombre:
+            if es_recuadro and not RECUADRO_SIN_NOMBRE_A_REVISION:
+                nombre, apellido = f"SIN NOMBRE {datetime.now():%H%M%S}", ""
+                log.warning("RECUADRO sin nombre legible; se guarda con etiqueta provisional.")
+                diagnostico = list(debug)
+                avisar("Recuadro sin nombre", "Se guardó como RECUADRO; revisa el nombre a mano.", 5)
+            else:
+                return self.a_revision(archivos, modo, "sin_nombre", debug)
+
+        persona = " ".join(p for p in (nombre, apellido) if p)
+        carpeta = limpiar_ruta(f"{folio}-{persona}-{capturista}").upper().strip("-. ")
+        ruta_final = os.path.join(RUTA_BASE, limpiar_ruta(clave), fecha_carpeta(), carpeta)
+        for f in archivos:
+            if os.path.exists(f):
+                mover_seguro(f, ruta_final)
+
+        if diagnostico:
             try:
-                shutil.move(archivo, os.path.join(ruta_revision, os.path.basename(archivo)))
-            except Exception:
-                pass
-        
-        notification.notify(
-            title="Atención",
-            message="Faltaron datos, archivos movidos a revisión manual",
-            app_name="Auditor Automático",
-            timeout=5
-        )
+                with open(os.path.join(ruta_final, "_diagnostico_ocr.txt"), "w", encoding="utf-8") as fh:
+                    fh.write("\n\n".join(diagnostico))
+            except Exception as e:
+                log.warning("No se pudo guardar el diagnóstico: %s", e)
+        log.info("Lote %s procesado, folio %s (%.1fs)", modo, folio, time.time() - t0)
+        self.publicar_estado(f"✔ {carpeta}")
+        avisar("Éxito", f"Carpeta creada:\n{carpeta}", 3)
 
-# --- 3. EL PERRO GUARDIÁN CORREGIDO (WATCHDOG) ---
-class VigilanteDescargas(FileSystemEventHandler):
-    def __init__(self, procesador, app_gui):
+    def a_revision(self, archivos, modo, motivo, debug=()):
+        ahora = datetime.now()
+        carpeta = os.path.join(RUTA_BASE, f"REVISION_MANUAL_{ahora:%Y-%m-%d}",
+                               f"{ahora:%H%M%S}-{modo or 'LOTE'}-{motivo}")
+        for f in archivos:
+            if os.path.exists(f):
+                try:
+                    mover_seguro(f, carpeta)
+                except Exception as e:
+                    log.error("No se pudo mover %s a revisión: %s", f, e)
+        if debug:
+            try:
+                with open(os.path.join(carpeta, "_diagnostico_ocr.txt"), "w", encoding="utf-8") as fh:
+                    fh.write("\n\n".join(debug))
+            except Exception as e:
+                log.warning("No se pudo guardar el diagnóstico: %s", e)
+        log.warning("Lote %s a revisión manual (%s)", modo, motivo)
+        self.publicar_estado(f"⚠ Revisión manual: {MOTIVOS.get(motivo, motivo)}")
+        avisar("Atención", f"{MOTIVOS.get(motivo, motivo)}. Archivos movidos a revisión manual.", 5)
+
+# ---------------------------------------------------------------- 6. LOTES + VIGILANTE
+class GestorLotes:
+    """Agrupa los archivos por lote (mismo timestamp) y procesa un lote a la vez."""
+
+    def __init__(self, procesador, obtener_datos):
         self.procesador = procesador
-        self.app = app_gui
-        self.archivos_pendientes = set()
-        self.timer = None
+        self.obtener_datos = obtener_datos
+        self.lotes = {}
+        self.lock = threading.Lock()
+        self.activo = True
 
-    def procesar_ruta(self, ruta):
+    def iniciar(self):
+        threading.Thread(target=self._bucle, daemon=True, name="gestor-lotes").start()
+
+    def detener(self):
+        self.activo = False
+
+    def registrar(self, ruta):
         nombre = os.path.basename(ruta)
-        if nombre.startswith("WP_") and not nombre.endswith(('.tmp', '.crdownload', '.part')):
-            if ruta not in self.archivos_pendientes:
-                self.archivos_pendientes.add(ruta)
-                print(f"Capturado: {nombre} ({len(self.archivos_pendientes)} archivos en búfer)")
-                
-                if self.timer: self.timer.cancel()
-                self.timer = threading.Timer(4.0, self.verificar_y_procesar)
-                self.timer.start()
+        if not nombre.startswith("WP_") or nombre.lower().endswith(EXT_TEMPORALES):
+            return
+        info = clasificar_archivo(nombre)
+        if not info:
+            return
+        lote_id, modo = info
+        ahora = time.time()
+        with self.lock:
+            lote = self.lotes.setdefault(lote_id, {"archivos": set(), "modo": modo, "ultimo": ahora})
+            if ruta not in lote["archivos"]:
+                log.info("Capturado: %s (%d en el lote)", nombre, len(lote["archivos"]) + 1)
+            lote["archivos"].add(ruta)
+            lote["ultimo"] = ahora
+            lote["modo"] = lote["modo"] or modo
+
+    def _lotes_listos(self):
+        ahora, listos = time.time(), []
+        with self.lock:
+            for lote_id, lote in list(self.lotes.items()):
+                reposo = ahora - lote["ultimo"]
+                esperado = ESPERADOS.get(lote["modo"])
+                completo = esperado is not None and len(lote["archivos"]) >= esperado and reposo >= 1.0
+                legado = esperado is None and reposo >= ESPERA_LOTE_LEGADO
+                if completo or legado or reposo >= ESPERA_LOTE_INCOMPLETO:
+                    listos.append(self.lotes.pop(lote_id))
+        return listos
+
+    def _bucle(self):
+        while self.activo:
+            time.sleep(0.5)
+            for lote in self._lotes_listos():
+                try:
+                    self._despachar(lote)
+                except Exception:
+                    log.exception("Fallo al despachar lote")
+
+    @staticmethod
+    def _esperar_estables(archivos, limite=8.0):
+        fin, previos = time.time() + limite, {}
+        while time.time() < fin:
+            tamanos = {}
+            for f in archivos:
+                try:
+                    tamanos[f] = os.path.getsize(f)
+                except OSError:
+                    tamanos[f] = -1
+            if tamanos == previos and all(v > 0 for v in tamanos.values()):
+                return
+            previos = tamanos
+            time.sleep(0.4)
+
+    def _despachar(self, lote):
+        archivos = sorted(f for f in lote["archivos"] if os.path.exists(f))
+        if not archivos:
+            return
+        modo = lote["modo"] or MODO_POR_CANTIDAD.get(len(archivos))
+        if modo is None:
+            log.info("Lote ignorado: %d archivos (se esperan 3, 4 o 5).", len(archivos))
+            return
+        if len(archivos) < ESPERADOS[modo]:
+            self.procesador.a_revision(archivos, modo, "lote_incompleto")
+            return
+        self._esperar_estables(archivos)
+        clave, capturista = self.obtener_datos()
+        if not clave or not capturista:
+            avisar("Atención", "Falta la clave o el capturista en la ventana del Auditor.", 5)
+        avisar("Procesando", f"{modo}: {len(archivos)} archivos detectados. Iniciando lectura...", 2)
+        try:
+            self.procesador.procesar_lote(archivos, modo, clave or "SIN_CLAVE", capturista or "SIN_CAPTURISTA")
+        except Exception:
+            log.exception("Error crítico procesando lote")
+            self.procesador.a_revision(archivos, modo, "error")
+
+class VigilanteDescargas(FileSystemEventHandler):
+    def __init__(self, gestor):
+        self.gestor = gestor
 
     def on_created(self, event):
-        if not event.is_directory: self.procesar_ruta(event.src_path)
+        if not event.is_directory:
+            self.gestor.registrar(event.src_path)
+
     def on_moved(self, event):
-        if not event.is_directory: self.procesar_ruta(event.dest_path)
+        if not event.is_directory:
+            self.gestor.registrar(event.dest_path)
+
     def on_modified(self, event):
-        if not event.is_directory: self.procesar_ruta(event.src_path)
+        if not event.is_directory:
+            self.gestor.registrar(event.src_path)
 
-    def verificar_y_procesar(self):
-        archivos = list(self.archivos_pendientes)
-        self.archivos_pendientes.clear()
-        
-        if len(archivos) in [3, 4, 5]:
-            notification.notify(
-                title="Procesando",
-                message=f"{len(archivos)} archivos detectados. Iniciando lectura...",
-                app_name="Auditor Automático",
-                timeout=2
-            )
-            clave = self.app.combo_clave.get()
-            capturista = self.app.combo_capturista.get()
-            
-            time.sleep(1) 
-            self.procesador.procesar_archivos(archivos, clave, capturista)
-        elif len(archivos) > 0:
-            print(f"Lote ignorado: Se detectaron {len(archivos)} archivos. No coincide con 3, 4 o 5.")
+# ---------------------------------------------------------------- 6b. REPORTES A TELEGRAM
+def cargar_telegram():
+    """Token y chat: variables de entorno > telegram.json (junto al script) > constantes."""
+    datos = {}
+    try:
+        with open(ARCHIVO_TELEGRAM, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("telegram.json ilegible: %s", e)
+    token = os.environ.get("AUDITOR_TG_TOKEN") or datos.get("token") or TELEGRAM_TOKEN
+    chat = os.environ.get("AUDITOR_TG_CHAT") or datos.get("chat_id") or TELEGRAM_CHAT_ID
+    return str(token).strip(), str(chat).strip()
 
-# --- 4. INTERFAZ GRÁFICA (GUI) ---
+def cargar_relay():
+    """URL del relay: variable de entorno > telegram.json (relay_url) > constante URL_RELAY."""
+    datos = {}
+    try:
+        with open(ARCHIVO_TELEGRAM, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+    except (OSError, ValueError):
+        pass
+    return str(os.environ.get("AUDITOR_RELAY_URL") or datos.get("relay_url") or URL_RELAY).strip()
+
+def _sin_token(texto):
+    """Los errores de requests incluyen la URL (y con ella el token): nunca mostrarlos ni guardarlos tal cual."""
+    token = cargar_telegram()[0]
+    return str(texto).replace(token, "***") if token else str(texto)
+
+def leer_log_reciente(max_bytes=150_000):
+    for h in log.handlers:
+        h.flush()
+    try:
+        with open(ARCHIVO_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            tam = f.tell()
+            f.seek(max(0, tam - max_bytes))
+            datos = f.read()
+        if tam > max_bytes:
+            datos = datos.split(b"\n", 1)[-1]  # descarta la línea cortada
+        return datos or None
+    except OSError:
+        return None
+
+def _validar_telegram(resp):
+    try:
+        j = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Respuesta inesperada de Telegram (HTTP {resp.status_code}).") from None
+    if not j.get("ok"):
+        raise RuntimeError(f"Telegram rechazó el envío: {j.get('description', resp.status_code)}")
+
+def _preparar_imagen_relay(ruta):
+    """Devuelve (nombre, mime, bytes). Reduce imágenes pesadas o de formato raro para que el envío sea ligero."""
+    with open(ruta, "rb") as f:
+        datos = f.read()
+    nombre = os.path.basename(ruta)
+    if len(datos) > 3_000_000 or not nombre.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        img = cv2.imdecode(np.frombuffer(datos, np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            escala = min(1.0, 1600 / max(img.shape[:2]))
+            if escala < 1.0:
+                img = cv2.resize(img, None, fx=escala, fy=escala, interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ok:
+                datos, nombre = buf.tobytes(), os.path.splitext(nombre)[0] + ".jpg"
+    if len(datos) > 8_000_000:
+        raise RuntimeError("la imagen pesa demasiado")
+    bajo = nombre.lower()
+    mime = "image/png" if bajo.endswith(".png") else "image/webp" if bajo.endswith(".webp") else "image/jpeg"
+    return nombre, mime, datos
+
+HOSTS_ECHO = ("googleusercontent.com",)  # Apps Script contesta el POST con una redirección a este dominio
+AVISO_SIN_CONFIRMAR = "No se pudo confirmar la recepción del reporte"
+
+def _resumen_respuesta(r):
+    """Resumen corto (sin secretos) de una respuesta rara, para dejarlo en auditor.log."""
+    cuerpo = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text or "")).strip()[:200]
+    return f"HTTP {r.status_code} · {r.headers.get('Content-Type', '?')} · {urlparse(r.url).netloc} · «{cuerpo}»"
+
+def _pista_relay(r):
+    t = (r.text or "").lower()
+    if "accounts.google.com" in r.url or "sign in" in t or "iniciar sesión" in t:
+        return "El relay pide iniciar sesión: publícalo con acceso «Cualquier persona»."
+    if r.status_code in (403, 407) or "blocked" in t or "bloquead" in t or "firewall" in t:
+        return "La red parece estar bloqueando la respuesta de Google."
+    return "Respuesta inesperada del servidor de reportes."
+
+def _enviar_por_relay(url, texto, log_bytes, nombre_log, ruta_imagen):
+    """Envía el reporte al relay de Apps Script (que es quien tiene el token). Devuelve avisos."""
+    avisos = []
+    payload = {"texto": texto[:4000], "version": VERSION_LOCAL}
+    if log_bytes:
+        payload["log"] = {"nombre": nombre_log, "b64": base64.b64encode(log_bytes).decode("ascii")}
+    if ruta_imagen:
+        try:
+            nombre, mime, datos = _preparar_imagen_relay(ruta_imagen)
+            payload["imagen"] = {"nombre": nombre, "mime": mime, "b64": base64.b64encode(datos).decode("ascii")}
+        except (OSError, RuntimeError) as e:
+            avisos.append(f"no se pudo adjuntar la imagen ({e})")
+    # Apps Script primero ejecuta doPost y luego contesta con una redirección (302) donde está el resultado.
+    # Seguimos los dos pasos a mano para saber en cuál falla.
+    procesado = False
+    try:
+        r = requests.post(url, json=payload, timeout=90, allow_redirects=False)
+        destino = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and destino:
+            destino = urljoin(url, destino)
+            procesado = urlparse(destino).netloc.endswith(HOSTS_ECHO)
+            r = requests.get(destino, timeout=60)
+    except requests.RequestException as e:
+        if procesado:  # el servidor ya recibió y procesó el reporte; solo falló la confirmación
+            log.warning("Relay: reporte procesado pero falló la confirmación (%s)", type(e).__name__)
+            return avisos + [AVISO_SIN_CONFIRMAR]
+        raise RuntimeError(f"No se pudo contactar al servidor de reportes ({type(e).__name__}).") from None
+    try:
+        j = r.json()
+    except ValueError:
+        log.warning("Relay: respuesta que no es JSON -> %s", _resumen_respuesta(r))
+        if procesado:
+            return avisos + [AVISO_SIN_CONFIRMAR]
+        raise RuntimeError(f"{_pista_relay(r)} (HTTP {r.status_code})") from None
+    if not j.get("ok"):
+        raise RuntimeError(f"El servidor de reportes rechazó el envío: {j.get('error', 'sin detalle')}")
+    avisos.extend(str(a) for a in (j.get("avisos") or []))
+    return avisos
+
+def enviar_a_telegram(texto, log_bytes=None, nombre_log="auditor_log.txt", ruta_imagen=None):
+    """Envía mensaje + adjuntos. Devuelve una lista de avisos (adjuntos que fallaron).
+    Lanza RuntimeError si no se pudo enviar el mensaje principal."""
+    relay = cargar_relay()
+    if relay:
+        return _enviar_por_relay(relay, texto, log_bytes, nombre_log, ruta_imagen)
+    token, chat = cargar_telegram()
+    if not token or not chat:
+        raise RuntimeError("El envío de reportes no está configurado en este equipo (falta telegram.json).")
+    base = f"https://api.telegram.org/bot{token}"
+    avisos = []
+
+    def llamar(metodo, **kw):
+        try:
+            r = requests.post(f"{base}/{metodo}", timeout=30, **kw)
+        except requests.RequestException as e:
+            raise RuntimeError(_sin_token(e)) from None
+        _validar_telegram(r)
+
+    llamar("sendMessage", data={"chat_id": chat, "text": texto[:4000]})
+
+    if log_bytes:
+        try:
+            llamar("sendDocument", data={"chat_id": chat, "caption": "📄 Log más reciente"},
+                   files={"document": (nombre_log, log_bytes)})
+        except RuntimeError as e:
+            avisos.append(f"no se pudo adjuntar el log ({e})")
+
+    if ruta_imagen:
+        try:
+            with open(ruta_imagen, "rb") as f:
+                datos = f.read()
+            nombre = os.path.basename(ruta_imagen)
+            es_foto = nombre.lower().endswith((".jpg", ".jpeg", ".png")) and len(datos) <= 9_000_000
+            enviado = False
+            if es_foto:
+                try:
+                    llamar("sendPhoto", data={"chat_id": chat, "caption": "🖼 Imagen adjunta"},
+                           files={"photo": (nombre, datos)})
+                    enviado = True
+                except RuntimeError:
+                    pass  # se reintenta como documento
+            if not enviado:
+                llamar("sendDocument", data={"chat_id": chat, "caption": "🖼 Imagen adjunta"},
+                       files={"document": (nombre, datos)})
+        except (OSError, RuntimeError) as e:
+            avisos.append(f"no se pudo adjuntar la imagen ({e})")
+    return avisos
+
+def guardar_reporte_local(texto, log_bytes=None, ruta_imagen=None):
+    """Copia del reporte en disco para cuando no hay internet o el bot no responde."""
+    carpeta = os.path.join(RUTA_BASE, "REPORTES_PENDIENTES", f"{datetime.now():%Y%m%d_%H%M%S}")
+    os.makedirs(carpeta, exist_ok=True)
+    with open(os.path.join(carpeta, "reporte.txt"), "w", encoding="utf-8") as f:
+        f.write(texto)
+    if log_bytes:
+        with open(os.path.join(carpeta, "auditor_log.txt"), "wb") as f:
+            f.write(log_bytes)
+    if ruta_imagen and os.path.isfile(ruta_imagen):
+        shutil.copy2(ruta_imagen, carpeta)
+    return carpeta
+
+# ---------------------------------------------------------------- 6c. VENTANAS (NOVEDADES / REPORTE)
+class VentanaNovedades(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Novedades del Auditor")
+        self.geometry("500x460")
+        self.transient(master)
+
+        marco = tk.Frame(self)
+        marco.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        barra = ttk.Scrollbar(marco)
+        texto = tk.Text(marco, wrap="word", yscrollcommand=barra.set, font=("Segoe UI", 10),
+                        relief="flat", padx=8, pady=8, bg=self.cget("bg"))
+        barra.config(command=texto.yview)
+        barra.pack(side="right", fill="y")
+        texto.pack(side="left", fill="both", expand=True)
+
+        texto.tag_configure("ver", font=("Segoe UI", 13, "bold"), spacing1=8, spacing3=4)
+        texto.tag_configure("fecha", font=("Segoe UI", 9), foreground="gray")
+        texto.tag_configure("item", lmargin1=14, lmargin2=30, spacing3=4)
+        for version, fecha, items in NOVEDADES:
+            texto.insert("end", f"Versión {version}", "ver")
+            texto.insert("end", f"   {fecha}\n", "fecha")
+            for it in items:
+                texto.insert("end", f"•  {it}\n", "item")
+            texto.insert("end", "\n")
+        texto.config(state="disabled")
+
+        tk.Button(self, text="Entendido", width=14, command=self.destroy).pack(pady=10)
+
+class VentanaReporte(tk.Toplevel):
+    COOLDOWN_SEGUNDOS = 30
+    MAX_IMAGEN_BYTES = 20_000_000
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Reportar un error")
+        self.geometry("470x560")
+        self.resizable(False, False)
+        self.transient(app)
+        self.ruta_imagen = None
+        self.cola = queue.Queue()
+
+        self.formulario = f = tk.Frame(self)
+        f.pack(fill="both", expand=True, padx=16, pady=10)
+
+        tk.Label(f, text="Tu nombre *").pack(anchor="w")
+        self.var_nombre = tk.StringVar(value=app.datos_actuales[1].title())
+        tk.Entry(f, textvariable=self.var_nombre).pack(fill="x", pady=(0, 8))
+
+        tk.Label(f, text="Celular (opcional)").pack(anchor="w")
+        self.var_celular = tk.StringVar()
+        tk.Entry(f, textvariable=self.var_celular).pack(fill="x", pady=(0, 8))
+
+        tk.Label(f, text="¿Qué pasó? Cuéntanos los detalles *").pack(anchor="w")
+        self.txt_detalles = tk.Text(f, height=8, wrap="word")
+        self.txt_detalles.pack(fill="x", pady=(0, 8))
+
+        fila = tk.Frame(f)
+        fila.pack(fill="x", pady=(0, 8))
+        tk.Button(fila, text="Adjuntar imagen (opcional)…", command=self.elegir_imagen).pack(side="left")
+        self.label_imagen = tk.Label(fila, text="Ninguna", fg="gray")
+        self.label_imagen.pack(side="left", padx=8)
+        self.boton_quitar = tk.Button(fila, text="Quitar", command=self.quitar_imagen, state="disabled")
+        self.boton_quitar.pack(side="right")
+
+        self.var_log = tk.BooleanVar(value=True)
+        tk.Checkbutton(f, variable=self.var_log, justify="left",
+                       text="Adjuntar el registro (log) más reciente del programa.\n"
+                            "No incluye nombres de clientes.").pack(anchor="w", pady=(0, 8))
+
+        self.label_estado = tk.Label(f, text="", fg="gray", wraplength=430)
+        self.label_estado.pack(pady=(0, 6))
+        botones = tk.Frame(f)
+        botones.pack()
+        self.boton_enviar = tk.Button(botones, text="Enviar reporte", width=16, command=self.enviar)
+        self.boton_enviar.pack(side="left", padx=6)
+        tk.Button(botones, text="Cancelar", width=12, command=self.destroy).pack(side="left", padx=6)
+
+    # --- adjuntos
+    def elegir_imagen(self):
+        ruta = filedialog.askopenfilename(
+            parent=self, title="Elige una imagen",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.webp *.bmp"), ("Todos los archivos", "*.*")])
+        if not ruta:
+            return
+        try:
+            if os.path.getsize(ruta) > self.MAX_IMAGEN_BYTES:
+                messagebox.showwarning("Imagen muy pesada", "La imagen pesa más de 20 MB. Elige una más ligera.", parent=self)
+                return
+        except OSError:
+            return
+        self.ruta_imagen = ruta
+        self.label_imagen.config(text=os.path.basename(ruta)[:30], fg="black")
+        self.boton_quitar.config(state="normal")
+
+    def quitar_imagen(self):
+        self.ruta_imagen = None
+        self.label_imagen.config(text="Ninguna", fg="gray")
+        self.boton_quitar.config(state="disabled")
+
+    # --- envío
+    def enviar(self):
+        nombre = self.var_nombre.get().strip()
+        celular = self.var_celular.get().strip()
+        detalles = self.txt_detalles.get("1.0", "end").strip()
+
+        if not nombre:
+            messagebox.showwarning("Falta tu nombre", "Escribe tu nombre para que soporte sepa quién reporta.", parent=self)
+            return
+        if len(detalles) < 10:
+            messagebox.showwarning("Faltan detalles", "Cuéntanos con un poco más de detalle qué pasó.", parent=self)
+            return
+        if celular and len(re.sub(r"\D", "", celular)) < 8:
+            messagebox.showwarning("Celular incompleto", "Revisa el número de celular o déjalo vacío.", parent=self)
+            return
+        if time.time() - getattr(self.app, "ultimo_reporte", 0) < self.COOLDOWN_SEGUNDOS:
+            messagebox.showinfo("Reporte reciente", "Ya enviaste un reporte hace un momento. Espera unos segundos.", parent=self)
+            return
+
+        clave, capturista = self.app.datos_actuales
+        texto = (
+            f"🐞 REPORTE DE ERROR — Auditor v{VERSION_LOCAL}\n"
+            f"👤 {nombre}\n"
+            f"📱 {celular or '—'}\n"
+            f"💻 {platform.node()} · {platform.platform()}\n"
+            f"🗂 Clave: {clave or '—'} · Capturista: {capturista or '—'}\n"
+            f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📍 Último estado: {self.app.label_estado.cget('text')}\n\n"
+            f"📝 Detalles:\n{detalles[:3000]}"
+        )
+        log_bytes = leer_log_reciente() if self.var_log.get() else None
+        nombre_seguro = re.sub(r"\W+", "_", nombre)
+        nombre_log = f"auditor_log_{nombre_seguro}_{datetime.now():%Y%m%d_%H%M%S}.txt"
+
+        self.boton_enviar.config(state="disabled")
+        self.label_estado.config(text="Enviando reporte...", fg="blue")
+        threading.Thread(target=self._trabajo, args=(texto, log_bytes, nombre_log, self.ruta_imagen),
+                         daemon=True).start()
+        self.after(200, self._poll)
+
+    def _trabajo(self, texto, log_bytes, nombre_log, ruta_imagen):
+        try:
+            avisos = enviar_a_telegram(texto, log_bytes, nombre_log, ruta_imagen)
+            self.cola.put(("ok", avisos, None))
+        except Exception as e:
+            motivo = _sin_token(e)
+            log.warning("No se pudo enviar el reporte: %s", motivo)
+            carpeta = None
+            try:
+                carpeta = guardar_reporte_local(texto, log_bytes, ruta_imagen)
+            except Exception as e2:
+                log.warning("No se pudo guardar el reporte local: %s", e2)
+            self.cola.put(("error", motivo, carpeta))
+
+    def _poll(self):
+        if not self.winfo_exists():  # la cerraron mientras se enviaba
+            return
+        try:
+            tipo, a, b = self.cola.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll)
+            return
+        self._mostrar_final(tipo, a, b)
+
+    # --- pantalla final: seguir con la actual o volver a la estable
+    def _mostrar_final(self, tipo, a, b):
+        for w in self.formulario.winfo_children():
+            w.destroy()
+        f = self.formulario
+        if tipo == "ok":
+            self.app.ultimo_reporte = time.time()
+            titulo, detalle = "✅ Reporte enviado", "Gracias, soporte ya lo recibió."
+            if any(x.startswith(AVISO_SIN_CONFIRMAR) for x in a):
+                detalle = ("El reporte se envió, pero el servidor no confirmó la recepción.\n"
+                           "Si soporte no se comunica contigo, vuelve a intentarlo o avísales directamente.")
+                a = [x for x in a if not x.startswith(AVISO_SIN_CONFIRMAR)]
+            if a:
+                detalle += "\n\nNota: " + "; ".join(a)
+        else:
+            titulo = "⚠️ No se pudo enviar el reporte"
+            detalle = f"Motivo: {a}"
+            if b:
+                detalle += f"\n\nSe guardó una copia en:\n{b}\nPásala a soporte en cuanto puedas."
+
+        tk.Label(f, text=titulo, font=("Segoe UI", 13, "bold")).pack(pady=(10, 4))
+        tk.Label(f, text=detalle, wraplength=420, justify="left").pack(pady=4)
+        tk.Label(f, text="¿Cómo quieres seguir?", font=("Segoe UI", 10, "bold")).pack(pady=(18, 6))
+        tk.Button(f, text="Descargar la versión estable anterior", command=self.usar_estable).pack(fill="x", pady=3)
+        tk.Label(f, text="Se instala la versión estable anterior y el programa se reinicia.",
+                 fg="gray", wraplength=420).pack()
+        tk.Button(f, text="Continuar con la versión actual", command=self.destroy).pack(fill="x", pady=(12, 3))
+
+    def usar_estable(self):
+        if messagebox.askyesno("Versión estable",
+                               "El programa se cerrará y se abrirá de nuevo con la versión estable anterior.\n\n¿Continuar?",
+                               parent=self):
+            self.app.iniciar_instalacion(URL_CODIGO_ESTABLE, rollback=True)
+            self.destroy()
+
+# ---------------------------------------------------------------- 7. INTERFAZ
+def ejecutable_sin_consola():
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        w = exe[:-10] + "pythonw.exe"
+        if os.path.exists(w):
+            return w
+    return exe
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Auditor Automático v{VERSION_LOCAL}")
-        self.geometry("350x280")
-        self.config = self.cargar_config()
+        self.geometry("380x390")
+        self.resizable(False, False)
+        self.cfg = self.cargar_config()
+        self.cola_ui = queue.Queue()
+        self.datos_actuales = ("", "")
 
-        # --- NUEVO: Etiqueta de actualización oculta por defecto ---
-        self.label_alerta = tk.Label(self, text="", fg="red", font=("Arial", 10, "bold"))
-        self.label_alerta.pack(pady=(5, 0))
+        self.label_alerta = tk.Label(self, text="", fg="red", font=("Arial", 10, "bold"), wraplength=330)
+        self.label_alerta.pack(pady=(30, 0))
+
+        self.var_clave = tk.StringVar(value=self.cfg.get("ultima_clave", ""))
+        self.var_capturista = tk.StringVar(value=self.cfg.get("ultimo_capturista", ""))
 
         tk.Label(self, text="Clave de Captura:").pack(pady=(10, 0))
-        self.combo_clave = ttk.Combobox(self, values=self.config.get("claves", ["CLAVE-01"]))
-        self.combo_clave.set(self.config.get("ultima_clave", ""))
+        self.combo_clave = ttk.Combobox(self, textvariable=self.var_clave,
+                                        values=self.cfg.get("claves", ["CLAVE-01"]))
         self.combo_clave.pack()
 
         tk.Label(self, text="Nombre del Capturista:").pack(pady=(10, 0))
-        self.combo_capturista = ttk.Combobox(self, values=self.config.get("capturistas", ["JUAN PEREZ"]))
-        self.combo_capturista.set(self.config.get("ultimo_capturista", ""))
+        self.combo_capturista = ttk.Combobox(self, textvariable=self.var_capturista,
+                                             values=self.cfg.get("capturistas", ["JUAN PEREZ"]))
         self.combo_capturista.pack()
 
-        self.var_inicio = tk.BooleanVar(value=self.config.get("auto_inicio", False))
-        tk.Checkbutton(self, text="Iniciar con Windows", variable=self.var_inicio, command=self.toggle_inicio).pack(pady=10)
+        self.var_inicio = tk.BooleanVar(value=self.cfg.get("auto_inicio", False))
+        tk.Checkbutton(self, text="Iniciar con Windows", variable=self.var_inicio,
+                       command=self.toggle_inicio).pack(pady=10)
+        tk.Button(self, text="Guardar y Minimizar", command=self.guardar_y_minimizar).pack(pady=5)
 
-        tk.Button(self, text="Guardar y Minimizar", command=self.guardar_y_minimizar).pack(pady=10)
+        self.label_estado = tk.Label(self, text="Vigilando Descargas...", fg="gray", wraplength=330)
+        self.label_estado.pack(pady=10)
+
+        tk.Button(self, text="Novedades", command=self.mostrar_novedades, relief="flat",
+                  fg="#1565c0", cursor="hand2").place(relx=1.0, x=-6, y=6, anchor="ne")
+        tk.Button(self, text="🐞 Reportar error", command=self.abrir_reporte, relief="flat",
+                  fg="#d32f2f", cursor="hand2").place(relx=1.0, rely=1.0, x=-6, y=-6, anchor="se")
+
+        # Los hilos leen self.datos_actuales (no tocan widgets de Tk)
+        self.var_clave.trace_add("write", self._sincronizar_datos)
+        self.var_capturista.trace_add("write", self._sincronizar_datos)
+        self._sincronizar_datos()
+
+        self.procesador = ProcesadorDocumentos(lambda t: self.cola_ui.put(("estado", t)))
+        self.gestor = GestorLotes(self.procesador, lambda: self.datos_actuales)
+        self.observer = Observer()
+        self.observer.schedule(VigilanteDescargas(self.gestor), RUTA_DESCARGAS, recursive=False)
+        self.observer.start()
+        self.gestor.iniciar()
 
         threading.Thread(target=self.revisar_actualizacion, daemon=True).start()
-
-        self.procesador = ProcesadorDocumentos()
-        self.vigilante = VigilanteDescargas(self.procesador, self)
-        self.observer = Observer()
-        self.observer.schedule(self.vigilante, RUTA_DESCARGAS, recursive=False)
-        self.observer.start()
-
         self.protocol("WM_DELETE_WINDOW", self.cerrar_app)
+        self.after(300, self.inicio_ventanas)
+        self.after(500, self._poll_ui)
 
+    # --- utilidades de UI
+    def _sincronizar_datos(self, *_):
+        self.datos_actuales = (self.var_clave.get().strip().upper(),
+                               self.var_capturista.get().strip().upper())
+
+    def _poll_ui(self):
+        try:
+            while True:
+                tipo, valor = self.cola_ui.get_nowait()
+                if tipo == "estado":
+                    self.label_estado.config(text=valor, fg="black")
+                elif tipo == "actualizacion":
+                    self.preguntar_actualizacion(valor)
+                elif tipo == "error_update":
+                    self.label_alerta.config(text="")
+                    messagebox.showerror("Error de Actualización",
+                                         f"No se pudo actualizar:\n{valor}\nPor favor avisa a soporte técnico.")
+                elif tipo == "reiniciar":
+                    self.cerrar_app()
+                    return
+        except queue.Empty:
+            pass
+        self.after(500, self._poll_ui)
+
+    def verificar_tesseract(self):
+        problema = tesseract_listo()
+        if problema:
+            messagebox.showwarning("Falta Tesseract OCR", problema)
+
+    def inicio_ventanas(self):
+        self.verificar_tesseract()
+        if self.cfg.get("version_novedades_vista") != VERSION_LOCAL:  # primera vez o recién actualizado
+            self.mostrar_novedades()
+
+    def _abrir_unica(self, atributo, clase):
+        v = getattr(self, atributo, None)
+        if v is not None and v.winfo_exists():
+            v.lift()
+            v.focus_force()
+            return
+        setattr(self, atributo, clase(self))
+
+    def mostrar_novedades(self):
+        self._abrir_unica("ventana_novedades", VentanaNovedades)
+        if self.cfg.get("version_novedades_vista") != VERSION_LOCAL:
+            self.cfg["version_novedades_vista"] = VERSION_LOCAL
+            self.guardar_config()
+
+    def abrir_reporte(self):
+        self._abrir_unica("ventana_reporte", VentanaReporte)
+
+    # --- actualización
     def revisar_actualizacion(self):
         try:
-            respuesta = requests.get(URL_VERSION_GITHUB, timeout=5)
-            version_nube = float(respuesta.text.strip())
-            
-            if version_nube > VERSION_LOCAL:
-                # Usamos self.after para que la ventana emergente no congele el hilo secundario
-                self.after(0, self.preguntar_actualizacion, version_nube)
+            r = requests.get(URL_VERSION_GITHUB, timeout=5)
+            r.raise_for_status()
+            nube = r.text.strip()
+            if (re.fullmatch(r"\d+(\.\d+)*", nube)
+                    and version_a_tupla(nube) > version_a_tupla(VERSION_LOCAL)
+                    and version_a_tupla(nube) > version_a_tupla(self.cfg.get("ignorar_hasta", "0"))):
+                self.cola_ui.put(("actualizacion", nube))
         except Exception as e:
-            print("No se pudo verificar la actualización:", e)
+            log.info("No se pudo verificar la actualización: %s", e)
 
     def preguntar_actualizacion(self, version_nube):
-        # Muestra la ventana emergente de Aceptar / Rechazar
-        respuesta = messagebox.askyesno(
-            "¡Actualización Disponible!",
-            f"Se ha detectado la versión {version_nube} en el servidor.\n\n"
-            f"¿Deseas descargarla e instalarla ahora? El programa se reiniciará."
-        )
-        if respuesta: # Si el usuario le dio a "Sí"
-            self.ejecutar_actualizacion()
+        if messagebox.askyesno(
+                "¡Actualización Disponible!",
+                f"Se ha detectado la versión {version_nube} en el servidor.\n\n"
+                f"¿Deseas descargarla e instalarla ahora? El programa se reiniciará."):
+            self.iniciar_instalacion(URL_CODIGO_GITHUB, version_nube)
 
-    def ejecutar_actualizacion(self):
+    def iniciar_instalacion(self, url, version_esperada=None, rollback=False):
+        """Descarga, valida e instala un .py nuevo (actualización o regreso a la versión estable) y reinicia."""
+        if rollback:
+            self.cfg["ignorar_hasta"] = VERSION_LOCAL  # no volver a ofrecer la versión que dio problemas
+            self.guardar_config()
+        self.label_alerta.config(text="Descargando versión estable..." if rollback else "Descargando actualización...",
+                                 fg="blue")
+        respaldo = os.path.abspath(__file__) + ".bak" if rollback else None
+        threading.Thread(target=self._instalar_codigo, args=(url, version_esperada, respaldo), daemon=True).start()
+
+    def _instalar_codigo(self, url, version_esperada, respaldo_local=None):
         try:
-            self.label_alerta = tk.Label(self, text="Descargando actualización...", fg="blue", font=("Arial", 10, "bold"))
-            self.label_alerta.pack(pady=5)
-            self.update() # Refresca la interfaz
+            try:
+                r = requests.get(url, timeout=20)
+                r.raise_for_status()
+                codigo = r.content
+            except Exception as e:
+                # Regreso a la estable sin internet / sin copia en GitHub: usar la versión que había antes (.bak)
+                if respaldo_local and os.path.isfile(respaldo_local):
+                    log.warning("No se pudo descargar la versión estable (%s); se usa la copia local anterior.", e)
+                    with open(respaldo_local, "rb") as f:
+                        codigo = f.read()
+                else:
+                    raise
+            texto = codigo.decode("utf-8-sig")
+            compile(texto, "auditor_nuevo.py", "exec")  # nunca instalar algo que no compila
+            m = re.search(r'^VERSION_LOCAL\s*=\s*["\']?([\d.]+)', texto, re.M)
+            if not m:
+                raise RuntimeError("El archivo descargado no parece ser el Auditor.")
+            if version_esperada and version_a_tupla(m.group(1)) < version_a_tupla(version_esperada):
+                raise RuntimeError("GitHub todavía no sirve el archivo nuevo (caché). Intenta en unos minutos.")
 
-            # 1. Descargamos el nuevo código de GitHub
-            nuevo_codigo_bytes = requests.get(URL_CODIGO_GITHUB, timeout=10).content
-
-            # --- CORRECCIÓN: RUTAS ABSOLUTAS ---
-            # 2. Obligamos a que se guarde en la MISMA carpeta exacta donde está el programa original
-            archivo_temp = os.path.join(RUTA_BASE, "auditor_temp.py")
-            with open(archivo_temp, "wb") as f:
-                f.write(nuevo_codigo_bytes)
-
-            # 3. Preparamos las rutas para el .bat (también con ruta absoluta)
             archivo_actual = os.path.abspath(__file__)
+            archivo_temp = os.path.join(RUTA_BASE, "auditor_temp.py")
             archivo_bat = os.path.join(RUTA_BASE, "actualizador.bat")
-            ruta_python = sys.executable
+            with open(archivo_temp, "wb") as f:
+                f.write(codigo)
+            shutil.copy2(archivo_actual, archivo_actual + ".bak")
 
-            # 4. Creamos el script .bat que hará el trabajo sucio
-            codigo_bat = f"""@echo off
-timeout /t 2 /nobreak > NUL
-move /Y "{archivo_temp}" "{archivo_actual}"
-start "" "{ruta_python}" "{archivo_actual}"
-del "%~f0"
-"""
+            codigo_bat = (
+                "@echo off\n"
+                "chcp 65001 > NUL\n"
+                "ping 127.0.0.1 -n 3 > NUL\n"
+                f'move /Y "{archivo_temp}" "{archivo_actual}" > NUL\n'
+                f'cd /d "{RUTA_BASE}"\n'
+                f'start "" "{sys.executable}" "{archivo_actual}"\n'
+                'del "%~f0"\n'
+            )
             with open(archivo_bat, "w", encoding="utf-8") as f:
                 f.write(codigo_bat)
-
-            # 5. Ejecutamos el .bat en segundo plano y cerramos el programa actual
-            subprocess.Popen([archivo_bat], shell=True)
-            self.cerrar_app()
-            sys.exit()
-
+            subprocess.Popen(["cmd", "/c", archivo_bat], creationflags=subprocess.CREATE_NO_WINDOW)
+            self.cola_ui.put(("reiniciar", None))
         except Exception as e:
-            messagebox.showerror("Error de Actualización", f"No se pudo actualizar:\n{e} \nPor favor avisa a soporte técnico.")
+            log.exception("Fallo la actualización")
+            self.cola_ui.put(("error_update", str(e)))
 
-    def cargar_config(self):
-        if os.path.exists(ARCHIVO_CONFIG):
-            with open(ARCHIVO_CONFIG, 'r') as f: return json.load(f)
+    # --- configuración
+    @staticmethod
+    def cargar_config():
+        try:
+            with open(ARCHIVO_CONFIG, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("config.json ilegible, se usa uno nuevo: %s", e)
         return {"claves": [], "capturistas": []}
 
     def guardar_config(self):
-        clave_actual = self.combo_clave.get().upper()
-        capturista_actual = self.combo_capturista.get().upper()
-        claves = list(self.combo_clave['values'])
-        if clave_actual and clave_actual not in claves: claves.append(clave_actual)
-        capturistas = list(self.combo_capturista['values'])
-        if capturista_actual and capturista_actual not in capturistas: capturistas.append(capturista_actual)
+        clave, capturista = self.datos_actuales
+        claves = list(self.combo_clave["values"])
+        capturistas = list(self.combo_capturista["values"])
+        if clave and clave not in claves:
+            claves.append(clave)
+        if capturista and capturista not in capturistas:
+            capturistas.append(capturista)
+        self.combo_clave["values"] = claves
+        self.combo_capturista["values"] = capturistas
 
-        nueva_config = {
-            "claves": claves, "capturistas": capturistas,
-            "ultima_clave": clave_actual, "ultimo_capturista": capturista_actual,
-            "auto_inicio": self.var_inicio.get()
-        }
-        with open(ARCHIVO_CONFIG, 'w') as f: json.dump(nueva_config, f)
+        self.cfg.update({"claves": claves, "capturistas": capturistas,
+                         "ultima_clave": clave, "ultimo_capturista": capturista,
+                         "auto_inicio": self.var_inicio.get()})
+        try:
+            tmp = ARCHIVO_CONFIG + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, ARCHIVO_CONFIG)
+        except Exception as e:
+            log.warning("No se pudo guardar config.json: %s", e)
 
     def toggle_inicio(self):
-        key = winreg.HKEY_CURRENT_USER
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         try:
-            registro = winreg.OpenKey(key, key_path, 0, winreg.KEY_ALL_ACCESS)
-            if self.var_inicio.get():
-                winreg.SetValueEx(registro, "AuditorWhatsApp", 0, winreg.REG_SZ, sys.executable + ' "' + os.path.abspath(__file__) + '"')
-            else:
-                winreg.DeleteValue(registro, "AuditorWhatsApp")
-            winreg.CloseKey(registro)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_ALL_ACCESS) as reg:
+                if self.var_inicio.get():
+                    cmd = f'"{ejecutable_sin_consola()}" "{os.path.abspath(__file__)}"'
+                    winreg.SetValueEx(reg, "AuditorWhatsApp", 0, winreg.REG_SZ, cmd)
+                else:
+                    try:
+                        winreg.DeleteValue(reg, "AuditorWhatsApp")
+                    except FileNotFoundError:
+                        pass
         except Exception as e:
-            print("Error en registro:", e)
+            log.warning("Error en registro: %s", e)
 
     def guardar_y_minimizar(self):
         self.guardar_config()
-        self.iconify() 
+        self.iconify()
 
     def cerrar_app(self):
         self.guardar_config()
+        self.gestor.detener()
         self.observer.stop()
-        self.observer.join()
+        self.observer.join(timeout=2)
         self.destroy()
 
+# ---------------------------------------------------------------- 8. INICIO
+def instancia_unica():
+    """Evita dos copias vigilando Descargas a la vez (reintenta por si viene de una actualización)."""
+    for _ in range(6):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            opcion = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if opcion is not None:
+                s.setsockopt(socket.SOL_SOCKET, opcion, 1)
+            s.bind(("127.0.0.1", 47653))
+            return s
+        except OSError:
+            s.close()
+            time.sleep(1)
+    return None
+
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    candado = instancia_unica()
+    if candado is None:
+        raiz = tk.Tk()
+        raiz.withdraw()
+        messagebox.showinfo("Auditor Automático", "El programa ya está abierto.")
+        sys.exit(0)
+    App().mainloop()
