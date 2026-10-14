@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auditor Automático de WhatsApp  -  v25.0
+Auditor Automático de WhatsApp  -  v25.1
 Vigila Descargas, lee con OCR los documentos bajados desde WhatsApp Web (SIAC / INE)
 y los acomoda en carpetas  FOLIO-NOMBRE APELLIDO-CAPTURISTA.
 """
@@ -24,9 +24,10 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin, urlparse
 
-VERSION_LOCAL = "25.0"
+VERSION_LOCAL = "25.1"
 URL_VERSION_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/version.txt"
 URL_CODIGO_GITHUB = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/auditor_archivos.py"
+# Copia de la última versión estable (se sube a mano al repo antes de publicar una versión nueva)
 URL_CODIGO_ESTABLE = "https://raw.githubusercontent.com/SuperAxxel/Auditor-WhatsApp/refs/heads/main/estable/auditor_archivos.py"
 
 RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +44,17 @@ RUTA_DESCARGAS = os.path.join(os.path.expanduser("~"), "Downloads")
 RECUADRO_SIN_NOMBRE_A_REVISION = False
 
 # ---------------------------------------------------------------- LOG
+class _ConsolaSegura(logging.StreamHandler):
+    """Consola que nunca rompe el programa (en algunas PCs con Windows antiguo escribir en stderr falla)."""
+    def flush(self):
+        try:
+            super().flush()
+        except Exception:
+            pass
+
+    def handleError(self, record):
+        pass
+
 def configurar_log():
     logger = logging.getLogger("auditor")
     logger.setLevel(logging.INFO)
@@ -51,7 +63,7 @@ def configurar_log():
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     if sys.stderr is not None:
-        sh = logging.StreamHandler()
+        sh = _ConsolaSegura()
         sh.setFormatter(fmt)
         logger.addHandler(sh)
     return logger
@@ -119,6 +131,18 @@ def tesseract_listo():
         return "A Tesseract le falta el idioma español (spa.traineddata)."
     return None
 
+VERSION_TESSERACT = "?"
+
+def registrar_entorno():
+    """Deja en el log (y en los reportes) las versiones que usa esta PC: ayuda a diagnosticar equipos antiguos."""
+    global VERSION_TESSERACT
+    try:
+        VERSION_TESSERACT = str(pytesseract.get_tesseract_version())
+    except Exception:
+        VERSION_TESSERACT = "no disponible"
+    log.info("Auditor v%s · Python %s · OpenCV %s · Tesseract %s · %s", VERSION_LOCAL, platform.python_version(),
+             cv2.__version__, VERSION_TESSERACT, platform.platform())
+
 # ---------------------------------------------------------------- 3. CONSTANTES Y UTILIDADES
 EXT_IMG = (".jpg", ".jpeg", ".png", ".webp")
 EXT_TEMPORALES = (".tmp", ".crdownload", ".part", ".download")
@@ -132,7 +156,10 @@ ETIQUETAS = {"NOMBRE", "NOMBRES", "CLIENTE"}
 PALABRAS_FIN_INE = {"DOMICILIO", "CALLE", "C", "AV", "AVENIDA", "EDAD", "SEXO", "CLAVE", "AÑO", "COL", "COLONIA"}
 PALABRAS_INE = ("ELECTORAL", "INSTITUTO", "NACIONAL", "CREDENCIAL", "VOTAR")
 
-RE_FOLIO = re.compile(r"FOLIO\s*(?:SIAC|STAC|S1AC)?\s*[:\-]?\s*(\d+)")
+# Tolera lecturas sucias del OCR: FOLÍO, FOLLO, F0LIO, "SIAC::" y números pegados
+RE_FOLIO = re.compile(r"F[O0]L[ILÍ1|]{1,2}[O0]\s*(?:SIAC|STAC|S1AC|SIA[CG])?\s*[:;.\-]*\s*(\d{5,})")
+# Algunas versiones de Tesseract/spa leen la letra O de esta tipografía como «º» (FºLIº, CºNTACTº, DATºS)
+_TABLA_OCR = str.maketrans({"º": "O", "°": "O", "˚": "O"})
 RE_PREFIJO_NOMBRE = re.compile(r"^(?:NOMBRES?|CLIENTE|TITULAR)\b\s*")
 RE_LOTE_NUEVO = re.compile(r"^WP_(RECUADRO|DESCARGAR|WINBACK)_(\d+)_", re.I)
 RE_LOTE_IMG_LEGADO = re.compile(r"^WP_IMG_(\d+)_", re.I)
@@ -151,14 +178,22 @@ MOTIVOS = {
 
 # Agrega la versión nueva ARRIBA de la lista en cada release (la ventana se abre sola al actualizar)
 NOVEDADES = [
+    ("25.1", "Octubre 2026", [
+        "Corregido: en algunas computadoras con Windows antiguo el programa se cerraba al enviar un reporte de error.",
+        "Corregido: en computadoras donde la lectura confundía la letra O con «º» (FºLIº SIAC) no se encontraba el folio "
+        "y todo se iba a revisión manual. Ahora se lee bien.",
+        "Si aun así no se encuentra el folio SIAC, se reintenta la lectura con otros modos antes de mandar el lote a revisión manual.",
+        "Los errores de la ventana ya no cierran el programa: aparece un aviso y el detalle queda en el registro.",
+        "El registro anota qué se pudo leer de cada imagen (sin nombres de clientes) y las versiones de Python y Tesseract, "
+        "para que soporte diagnostique más rápido.",
+    ]),
     ("25.0", "Octubre 2026", [
         "Los RECUADROS ya se etiquetan correctamente. Si no se alcanza a leer el nombre, se guardan como "
         "«RECUADRO-SIN NOMBRE» en lugar de irse a revisión manual.",
         "Lectura de la INE más precisa: varios intentos de lectura y corrección con nombres como David, Javier u Octavio.",
         "Procesamiento más rápido: las imágenes de cada cliente se leen al mismo tiempo.",
         "Si un lote llega incompleto, se manda a revisión manual en su propia subcarpeta, con el motivo en el nombre.",
-        "Descarga desde WhatsApp Web más confiable: solo toma imágenes del chat abierto. Recuerda darle Play "
-        "al audio de cada cliente antes de descargar.",
+        "Recuerda darle Play al audio de cada cliente antes de descargar desde WhatsApp Web.",
         "Nuevo botón «Reportar error»: envía tu mensaje, una imagen opcional y el registro del programa directo a soporte.",
         "Nuevo botón «Novedades» para volver a ver esta ventana cuando quieras.",
         "Actualizaciones más seguras: se valida el archivo antes de instalarlo y se conserva un respaldo.",
@@ -285,10 +320,11 @@ class ProcesadorDocumentos:
     @staticmethod
     def ocr(img, config=""):
         try:
-            return pytesseract.image_to_string(img, lang="spa", config=config, timeout=40).upper()
+            texto = pytesseract.image_to_string(img, lang="spa", config=config, timeout=40).upper()
         except Exception as e:
             log.warning("OCR falló: %s", e)
             return ""
+        return texto.translate(_TABLA_OCR)
 
     def leer_imagen(self, ruta):
         try:
@@ -328,16 +364,34 @@ class ProcesadorDocumentos:
                 return res
         return extraer_nombre_ine(preparar_lineas(lec["texto"]))  # último recurso: lectura natural
 
+    def reintentar_siac(self, lec, debug):
+        """Segunda oportunidad para el folio con otros modos de lectura (útil con Tesseract antiguo)."""
+        for etiqueta, cfg in (("psm6", "--psm 6"), ("psm11", "--psm 11")):
+            texto = self.ocr(lec["gris"], cfg)
+            debug.append(f"===== {os.path.basename(lec['ruta'])} (reintento SIAC {etiqueta}) =====\n{texto}")
+            m = RE_FOLIO.search(texto)
+            if m:
+                log.info("Folio SIAC encontrado con reintento '%s'", etiqueta)
+                return m.group(1), extraer_nombre_siac(preparar_lineas(texto))
+        return None, None
+
     def procesar_lote(self, archivos, modo, clave, capturista):
         t0 = time.time()
         es_recuadro = modo == "RECUADRO"
         imagenes = sorted(f for f in archivos if f.lower().endswith(EXT_IMG))
         lecturas = [l for l in self.pool.map(self.leer_imagen, imagenes) if l]
+        if len(lecturas) < len(imagenes):
+            log.warning("Solo se pudieron leer %d de %d imágenes.", len(lecturas), len(imagenes))
 
         debug, folio, nombre, apellido, origen = [], None, None, None, None
         diagnostico = None
         for lec in lecturas:
             debug.append(f"===== {os.path.basename(lec['ruta'])} (lectura natural) =====\n{lec['texto']}")
+            alto, ancho = lec["gris"].shape[:2]
+            log.info("Imagen %s: %dx%d, %d caracteres · FOLIO:%s DATOS:%s INE:%s", os.path.basename(lec["ruta"]),
+                     ancho, alto, len(lec["texto"].strip()), "sí" if "FOLIO" in lec["texto"] else "no",
+                     "sí" if "DATOS" in lec["texto"] else "no",
+                     "sí" if any(p in lec["texto"] for p in PALABRAS_INE) else "no")
             if not es_recuadro and not folio:
                 m = RE_FOLIO.search(lec["texto"])
                 if m:
@@ -360,9 +414,21 @@ class ProcesadorDocumentos:
                     origen = "INE"
                     break
 
+        if not es_recuadro and not folio:
+            for lec in lecturas:
+                if sum(p in lec["texto"] for p in PALABRAS_INE) >= 2:
+                    continue  # es una INE: no trae folio SIAC
+                folio, res = self.reintentar_siac(lec, debug)
+                if res and origen != "SIAC":
+                    nombre, apellido = res
+                    origen = "SIAC"
+                if folio:
+                    break
+
         if es_recuadro:
             folio = "RECUADRO"
         elif not folio:
+            log.warning("Ningún folio SIAC legible en %d imagen(es), ni con reintentos.", len(lecturas))
             return self.a_revision(archivos, modo, "sin_folio", debug)
 
         if not nombre:
@@ -551,7 +617,11 @@ def _sin_token(texto):
 
 def leer_log_reciente(max_bytes=150_000):
     for h in log.handlers:
-        h.flush()
+        if isinstance(h, RotatingFileHandler):
+            try:
+                h.flush()
+            except Exception:
+                pass
     try:
         with open(ARCHIVO_LOG, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -836,6 +906,7 @@ class VentanaReporte(tk.Toplevel):
             f"👤 {nombre}\n"
             f"📱 {celular or '—'}\n"
             f"💻 {platform.node()} · {platform.platform()}\n"
+            f"🔧 Python {platform.python_version()} · OpenCV {cv2.__version__} · Tesseract {VERSION_TESSERACT}\n"
             f"🗂 Clave: {clave or '—'} · Capturista: {capturista or '—'}\n"
             f"🕒 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
             f"📍 Último estado: {self.app.label_estado.cget('text')}\n\n"
@@ -1026,6 +1097,16 @@ class App(tk.Tk):
     def abrir_reporte(self):
         self._abrir_unica("ventana_reporte", VentanaReporte)
 
+    def report_callback_exception(self, exc, val, tb):
+        """Tk imprime en stderr (que puede fallar en Windows antiguo y cerrar el programa): lo mandamos al log."""
+        log.error("Error en la interfaz", exc_info=(exc, val, tb))
+        try:
+            messagebox.showerror("Error inesperado",
+                                 f"Ocurrió un error: {val}\n\nEl detalle quedó en auditor.log. "
+                                 "Puedes avisar con el botón «Reportar error».")
+        except Exception:
+            pass
+
     # --- actualización
     def revisar_actualizacion(self):
         try:
@@ -1185,4 +1266,5 @@ if __name__ == "__main__":
         raiz.withdraw()
         messagebox.showinfo("Auditor Automático", "El programa ya está abierto.")
         sys.exit(0)
+    registrar_entorno()
     App().mainloop()
